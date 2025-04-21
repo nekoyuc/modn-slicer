@@ -17,255 +17,6 @@ OUTPUT_PLAN_FILE = Path("slicing_plan.json")
 LAYER_HEIGHT = 0.2  # mm (Adjust based on your printer/desired quality)
 FILAMENT_DIAMETER = 1.75 # mm (Used for context, not direct calculation here)
 
-# --- Functions ---
-def identify_and_assign_colors_texture(mesh, num_colors=2):
-    """
-    Identifies dominant colors by sampling the mesh's texture map based on UV coordinates,
-    clusters these colors using K-Means, and assigns each face to a color index.
-
-    Args:
-        mesh (trimesh.Trimesh): The input mesh object, expected to have UVs and a texture.
-        num_colors (int): The expected number of distinct colors (extruders).
-
-    Returns:
-        tuple: (
-            face_color_indices (np.ndarray): Array mapping face index to cluster index (0 or 1).
-            cluster_centers (np.ndarray): The representative RGB colors (0-255) for each cluster.
-        )
-        Returns None, None if required visual information (UVs, texture) is missing or invalid.
-    """
-    print("Analyzing mesh texture colors...")
-
-    # --- Pre-requisite Checks ---
-    if not isinstance(mesh, trimesh.Trimesh):
-        print("Error: Input is not a valid Trimesh object.")
-        return None, None
-    if not mesh.visual or not hasattr(mesh.visual, 'uv') or mesh.visual.uv is None:
-        print("Error: Mesh does not have texture coordinates (UVs) defined in mesh.visual.uv.")
-        return None, None
-    if not hasattr(mesh.visual, 'material') or not mesh.visual.material:
-        print("Error: Mesh does not have a material defined.")
-        return None, None
-
-    material = mesh.visual.material
-    texture_image = None
-
-    # Try to get the base color texture (most common case)
-    if hasattr(material, 'baseColorTexture') and isinstance(material.baseColorTexture, Image.Image):
-        texture_image = material.baseColorTexture
-        print("Found baseColorTexture.")
-    # Fallback: Check other common texture attributes if needed (e.g., PBR metallicRoughness)
-    # elif hasattr(material, 'diffuseTexture') ... etc.
-    else:
-        # Sometimes trimesh stores texture image directly in visual if no complex material
-         if hasattr(mesh.visual, 'material_image') and isinstance(mesh.visual.material_image, Image.Image):
-              texture_image = mesh.visual.material_image
-              print("Found material_image on mesh.visual.")
-
-    if texture_image is None:
-        print("Error: Could not find a suitable texture image associated with the material.")
-        # You might need to inspect the specific material type (SimpleMaterial, PBRMaterial)
-        # and its attributes depending on how the GLB was exported.
-        print(f"Material type: {type(material)}")
-        # print(f"Material attributes: {dir(material)}") # Uncomment to debug material properties
-        return None, None
-
-    # --- Sample Texture Colors for Each Face ---
-    print("Sampling texture colors for each face...")
-    try:
-        # Calculate the average UV coordinate for each face center.
-        # mesh.visual.uv holds UVs per vertex: shape (n_vertices, 2)
-        # mesh.faces holds vertex indices per face: shape (n_faces, 3)
-        # We get UVs for each vertex of each face: shape (n_faces, 3, 2)
-        face_uvs = mesh.visual.uv[mesh.faces]
-        # Average the UVs for the 3 vertices of each face: shape (n_faces, 2)
-        face_uv_centers = face_uvs.mean(axis=1)
-
-        # Use trimesh's built-in function to sample colors at the given UV coordinates
-        # This handles the texture lookup and interpolation.
-        # It expects UVs, the mesh itself (to know which faces use which UVs), and the image.
-        # Note: uv_to_color might have slightly different args depending on trimesh version.
-        # Let's try passing the explicit image if available.
-        # We need to ensure the mesh's visual has the image assigned correctly for uv_to_color
-        # If uv_to_color doesn't work directly, manual sampling is needed.
-
-        # Check if the image is already linked correctly within trimesh's visual structure
-        if not (hasattr(mesh.visual, '_material_image_cache') and texture_image == mesh.visual._material_image_cache.get(mesh.visual.material.name)):
-             # Manually associate the found image if uv_to_color needs it implicitly
-             # This is a bit of a workaround, hoping uv_to_color picks it up
-             mesh.visual.material.baseColorTexture = texture_image
-             # mesh.visual.material_image = texture_image # Try assigning here too
-
-        print(f"Attempting to sample {len(face_uv_centers)} face UV centers...")
-        sampled_colors_rgba = mesh.visual.uv_to_color(face_uv_centers)
-
-        if sampled_colors_rgba is None:
-             print("Error: mesh.visual.uv_to_color returned None. Sampling failed.")
-             # Fallback: Manual sampling (more complex)
-             # You would need to convert UVs to pixel coords and use texture_image.getpixel()
-             print("Manual texture sampling not implemented in this example.")
-             return None, None
-
-        print(f"Sampled colors shape: {sampled_colors_rgba.shape}") # Should be (n_faces, 4)
-
-    except AttributeError as e:
-        print(f"Error during texture sampling (likely missing visual components): {e}")
-        print("Ensure the GLB has UVs and the texture image is loaded correctly by trimesh.")
-        return None, None
-    except Exception as e:
-        print(f"An unexpected error occurred during texture sampling: {e}")
-        return None, None
-
-    # --- Cluster the Sampled Colors ---
-    print(f"Clustering {len(sampled_colors_rgba)} sampled face colors into {num_colors} groups...")
-
-    # Ensure colors are RGB and normalized (0-1) for KMeans
-    if sampled_colors_rgba.shape[1] == 4:
-        colors_rgb = sampled_colors_rgba[:, :3]
-    elif sampled_colors_rgba.shape[1] == 3:
-        colors_rgb = sampled_colors_rgba
-    else:
-        print(f"Error: Unexpected sampled color format shape: {sampled_colors_rgba.shape}")
-        return None, None
-
-    # Normalize colors if they are 0-255 (uv_to_color usually returns 0-255)
-    if colors_rgb.max() > 1.0:
-        print("Normalizing sampled colors from 0-255 range to 0-1 range.")
-        colors_rgb_normalized = colors_rgb / 255.0
-    else:
-        colors_rgb_normalized = colors_rgb # Assume already normalized
-
-    unique_colors = np.unique(colors_rgb_normalized.round(decimals=5), axis=0) # Round to avoid floating point issues
-    print(f"Found {len(unique_colors)} unique sampled face colors (approx).")
-
-    if len(unique_colors) < num_colors:
-        print(f"Warning: Expected {num_colors} dominant colors, but found only {len(unique_colors)} unique sampled colors.")
-        # Decide how to proceed: Maybe assign all to extruder 0? Or error out?
-        # Let's try assigning based on the limited unique colors if possible.
-        if len(unique_colors) == 0: return None, None # No colors!
-        if len(unique_colors) == 1 and num_colors > 1:
-             print("Assigning all faces to extruder 0.")
-             face_color_indices = np.zeros(len(mesh.faces), dtype=int)
-             # Return the single color found as both cluster centers (not ideal, but provides output)
-             cluster_centers_normalized = np.vstack([unique_colors[0], unique_colors[0]])
-             return face_color_indices, cluster_centers_normalized * 255.0
-
-        # If len(unique_colors) < num_colors but > 1, KMeans might still work or fail.
-
-    try:
-        kmeans = KMeans(n_clusters=num_colors, random_state=0, n_init=10).fit(colors_rgb_normalized)
-        cluster_centers_normalized = kmeans.cluster_centers_
-
-        # Assign each *sampled face color* to the nearest cluster center
-        print("Assigning faces to color clusters based on sampled texture...")
-        face_color_indices = kmeans.predict(colors_rgb_normalized)
-    except Exception as e:
-        print(f"Error during K-Means clustering on sampled colors: {e}")
-        return None, None
-
-    print(f"Identified {num_colors} dominant color clusters from texture.")
-    print("Representative cluster colors (RGB 0-255 approx):")
-    cluster_centers_rgb255 = cluster_centers_normalized * 255.0
-    for i, color in enumerate(cluster_centers_rgb255):
-        print(f"  Extruder {i}: [{int(color[0])}, {int(color[1])}, {int(color[2])}]")
-
-    return face_color_indices, cluster_centers_rgb255faaaaa
-
-def create_meshes_for_extruders(mesh, face_color_indices, num_colors):
-    """
-    Creates separate mesh objects for each color/extruder.
-    """
-    print("Separating mesh geometry by assigned color...")
-    meshes_by_extruder = []
-    # Ensure vertices are copied, faces reference the *original* vertex indices
-    vertices = mesh.vertices.copy()
-
-    for i in range(num_colors):
-        extruder_face_mask = (face_color_indices == i)
-        extruder_faces = mesh.faces[extruder_face_mask]
-        if len(extruder_faces) > 0:
-            # Create a new mesh for this extruder's faces
-            # Important: It shares vertices with the original mesh for now
-            extruder_mesh = trimesh.Trimesh(vertices=vertices, faces=extruder_faces)
-            # Optional: Clean mesh to remove unused vertices (makes it self-contained)
-            # extruder_mesh.remove_unreferenced_vertices() # Be careful if slicing relies on original indices
-            meshes_by_extruder.append(extruder_mesh)
-            print(f"  Created mesh for Extruder {i} with {len(extruder_faces)} faces.")
-        else:
-            print(f"  Warning: No faces assigned to Extruder {i}.")
-            meshes_by_extruder.append(None) # Placeholder if an extruder has no geometry
-
-    return meshes_by_extruder
-
-def generate_slice_plan(meshes_by_extruder, layer_height):
-    """
-    Slices each extruder's mesh and compiles a layer-by-layer plan.
-    """
-    print(f"\nSlicing models with layer height: {layer_height}mm...")
-    num_extruders = len(meshes_by_extruder)
-    slicing_plan = {}
-
-    # Determine the Z-range for slicing across all meshes that exist
-    min_z = float('inf')
-    max_z = float('-inf')
-    valid_meshes_found = False
-    for mesh in meshes_by_extruder:
-        if mesh is not None and len(mesh.faces) > 0:
-            min_z = min(min_z, mesh.bounds[0, 2])
-            max_z = max(max_z, mesh.bounds[1, 2])
-            valid_meshes_found = True
-
-    if not valid_meshes_found:
-        print("Error: No valid mesh geometry found to slice.")
-        return None
-
-    # Define the Z heights for slicing
-    # Start slightly above the min Z to catch the first layer properly
-    z_levels = np.arange(min_z + layer_height / 2.0, max_z, layer_height)
-    print(f"Total layers: {len(z_levels)}")
-
-    if len(z_levels) == 0:
-        print("Warning: No layers generated. Check model height and layer height.")
-        return {}
-
-    for i, z in enumerate(z_levels):
-        print(f"\r  Slicing layer {i+1}/{len(z_levels)} at Z = {z:.3f}mm", end="")
-        layer_data = {}
-        plane_origin = [0, 0, z]
-        plane_normal = [0, 0, 1]
-
-        for extruder_index, mesh in enumerate(meshes_by_extruder):
-            extruder_key = f"extruder_{extruder_index}"
-            if mesh is not None and len(mesh.faces) > 0:
-                try:
-                    # Perform the slice
-                    section = mesh.section(plane_origin=plane_origin, plane_normal=plane_normal)
-
-                    if section is not None and len(section.entities) > 0:
-                        # Convert the 2D path (lines) into closed polygons (loops)
-                        # Trimesh sections can be complex (multiple disjoint loops)
-                        # 'polygons_closed' contains numpy arrays of vertices for each loop
-                        polygons, _ = trimesh.path.exchange.misc.paths_to_polygons(section.entities)
-
-                        # Store polygon data (list of vertex coordinates for each loop)
-                        # Convert to simple lists for JSON serialization
-                        layer_data[extruder_key] = [[vertex.tolist() for vertex in poly] for poly in polygons]
-                    else:
-                        layer_data[extruder_key] = [] # No geometry for this extruder at this layer
-                except Exception as e:
-                    print(f"\nWarning: Error slicing mesh for extruder {extruder_index} at Z={z:.3f}: {e}")
-                    layer_data[extruder_key] = []
-            else:
-                 layer_data[extruder_key] = [] # No mesh for this extruder
-
-        # Only add layer to plan if at least one extruder has geometry
-        if any(layer_data.values()):
-            slicing_plan[f"{z:.4f}"] = layer_data # Use Z height as key (string for JSON)
-        # else: print(f"\n  Skipping empty layer at Z = {z:.3f}mm")
-
-
-    print("\nSlicing complete.")
-    return slicing_plan
 
 
 '''
@@ -359,12 +110,18 @@ def get_face_colors_from_texture(mesh):
     """
     if not isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
         raise TypeError("Mesh visual is not TextureVisuals.")
+    else:
+        print("Mesh visual is Texture.")
     if not hasattr(mesh.visual, 'uv') or mesh.visual.uv is None:
          raise ValueError("Mesh does not have UV coordinates.")
+    else:
+        print("Mesh has UV coordinates.")
     if not hasattr(mesh.visual, 'material') or \
        not hasattr(mesh.visual.material, 'baseColorTexture') or \
        mesh.visual.material.baseColorTexture is None:
         raise ValueError("Mesh material does not have a baseColorTexture.")
+    else:
+        print("Mesh material has baseColorTexture.")
 
     texture = mesh.visual.material.baseColorTexture
     if not isinstance(texture, Image.Image):
@@ -386,16 +143,22 @@ def get_face_colors_from_texture(mesh):
                 raise ValueError("Cannot access texture image data.")
          except Exception as e:
              raise ValueError(f"Could not interpret texture: {e}")
+    else:
+        print("Texture is a valid PIL Image.")
 
     # Ensure texture is RGB
     if texture.mode == 'RGBA':
+        print("Converting RGBA texture to RGB.")
         # Create a white background image
         bg = Image.new('RGB', texture.size, (255, 255, 255))
         # Paste the RGBA image onto the white background
         bg.paste(texture, (0, 0), texture)
         texture = bg
     elif texture.mode != 'RGB':
+        print(f"Warning: Texture mode is not RGB (mode: {texture.mode}).")
         texture = texture.convert('RGB')
+    else:
+        print("Texture is already RGB.")
 
     tex_pixels = np.array(texture)
     tex_height, tex_width, _ = tex_pixels.shape
@@ -426,3 +189,198 @@ def get_face_colors_from_texture(mesh):
     
     print(f"Sampled {len(face_colors)} face colors from texture.")
     return np.array(face_colors)
+
+
+def get_face_colors_from_vertex_colors(mesh):
+    """
+    Calculates average color for each face based on vertex colors.
+    Assumes VertexColorVisuals.
+    Returns a numpy array of RGB colors, one per face.
+    """
+    if not isinstance(mesh.visual, trimesh.visual.color.VertexColorVisuals):
+         raise TypeError("Mesh visual is not VertexColorVisuals.")
+    if not hasattr(mesh.visual, 'vertex_colors') or mesh.visual.vertex_colors is None:
+        raise ValueError("Mesh does not have vertex colors.")
+
+    vertex_colors = mesh.visual.vertex_colors[:, :3] # Use only RGB, ignore alpha if present
+    face_colors = []
+
+    for face in mesh.faces:
+        # Get colors of vertices for the face and calculate the mean
+        face_color_avg = vertex_colors[face].mean(axis=0)
+        face_colors.append(face_color_avg)
+
+    return np.array(face_colors)
+
+def get_face_colors_from_face_colors(mesh):
+    """
+    Gets colors directly from face colors.
+    Assumes FaceColorVisuals.
+    Returns a numpy array of RGB colors, one per face.
+    """
+    if not isinstance(mesh.visual, trimesh.visual.color.FaceColorVisuals):
+         raise TypeError("Mesh visual is not FaceColorVisuals.")
+    if not hasattr(mesh.visual, 'face_colors') or mesh.visual.face_colors is None:
+        raise ValueError("Mesh does not have face colors.")
+
+    # Use only RGB, ignore alpha if present
+    return mesh.visual.face_colors[:, :3]
+
+
+def separate_mesh_by_color(glb_path, output_prefix):
+    """
+    Loads a GLB, determines face colors, clusters them into 2 groups,
+    and saves two separate STL files.
+    """
+    print(f"Loading mesh from {glb_path}...")
+    # Try loading directly as a mesh, handle scenes if necessary
+    try:
+        # use_uv=True is important for texture coordinates if present
+        # process=False prevents trimesh from merging geometries initially
+        loaded_data = trimesh.load(glb_path, force='scene', process=False)
+    except ValueError as e:
+        print(f"Warning: Could not load as scene, attempting to load as mesh. Error: {e}")
+        try:
+            loaded_data = trimesh.load(glb_path, force='mesh', process=False)
+        except Exception as e:
+            print(f"Error: Failed to load GLB file: {e}")
+            return
+
+    if isinstance(loaded_data, trimesh.Scene):
+        # Combine all meshes in the scene into one
+        # Note: This assumes you WANT to combine them. If they are separate
+        # parts meant to be processed individually, you'd loop through
+        # loaded_data.geometry.values() instead.
+        print("Scene detected, concatenating geometries...")
+        if not loaded_data.geometry:
+             print("Error: Scene contains no geometry.")
+             return
+        mesh = trimesh.util.concatenate(list(loaded_data.geometry.values()))
+    elif isinstance(loaded_data, trimesh.Trimesh):
+        mesh = loaded_data
+    else:
+        print(f"Error: Loaded data is not a Trimesh or Scene ({type(loaded_data)}).")
+        return
+
+    # Ensure the mesh has faces
+    if not hasattr(mesh, 'faces') or len(mesh.faces) == 0:
+        print("Error: Mesh has no faces.")
+        return
+
+    # Process the mesh to ensure standard format (e.g., unwelding vertices if needed for texture/color splits)
+    # This can potentially change vertex/face count and order
+    mesh.process()
+
+    print("Determining color source...")
+    face_colors = None
+    try:
+        if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals) and \
+           hasattr(mesh.visual.material, 'baseColorTexture') and \
+           mesh.visual.material.baseColorTexture is not None:
+            print("Color source: Texture mapping")
+            face_colors = get_face_colors_from_texture(mesh)
+
+        elif isinstance(mesh.visual, trimesh.visual.color.VertexColorVisuals) and \
+             hasattr(mesh.visual, 'vertex_colors') and \
+             mesh.visual.vertex_colors is not None:
+            print("Color source: Vertex colors")
+            face_colors = get_face_colors_from_vertex_colors(mesh)
+
+        elif isinstance(mesh.visual, trimesh.visual.color.FaceColorVisuals) and \
+             hasattr(mesh.visual, 'face_colors') and \
+             mesh.visual.face_colors is not None:
+             print("Color source: Face colors")
+             face_colors = get_face_colors_from_face_colors(mesh)
+
+        else:
+            # Check for simple PBR base color factor - this wouldn't usually be "two colors"
+            # but handle as a fallback maybe? Or raise error.
+            if hasattr(mesh.visual, 'material') and \
+               hasattr(mesh.visual.material, 'pbrMetallicRoughness') and \
+               hasattr(mesh.visual.material.pbrMetallicRoughness, 'baseColorFactor'):
+                 base_color = mesh.visual.material.pbrMetallicRoughness.baseColorFactor[:3]
+                 print(f"Color source: Simple material baseColorFactor {base_color}. Cannot split by two colors.")
+                 # Assign all faces the same color - splitting won't work well
+                 # face_colors = np.tile(np.array(base_color) * 255, (len(mesh.faces), 1))
+                 print("Error: Model seems to have only one uniform color. Cannot separate into two parts based on color.")
+                 return
+            else:
+                 print("Error: Could not determine valid color source (Texture, Vertex Colors, or Face Colors).")
+                 return
+
+    except (TypeError, ValueError, NotImplementedError, AttributeError) as e:
+        print(f"Error processing color information: {e}")
+        return
+    except Exception as e:
+        print(f"An unexpected error occurred during color processing: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+
+    if face_colors is None or len(face_colors) != len(mesh.faces):
+        print(f"Error: Failed to get valid color for each face. Expected {len(mesh.faces)}, Got {len(face_colors) if face_colors is not None else 0}.")
+        return
+
+    print(f"Performing K-Means clustering on {len(face_colors)} face colors...")
+    # Use K-Means to find the 2 dominant colors
+    try:
+        kmeans = KMeans(n_clusters=2, random_state=0, n_init=10).fit(face_colors)
+        labels = kmeans.labels_ # Array of 0s and 1s, assigning each face to a cluster
+        cluster_centers = kmeans.cluster_centers_ # The two representative colors
+    except Exception as e:
+        print(f"Error during K-Means clustering: {e}")
+        return
+
+    print(f"Cluster centers (representative colors): {cluster_centers.astype(int).tolist()}")
+
+    # Get the indices of the faces for each cluster
+    faces_cluster_0 = np.where(labels == 0)[0]
+    faces_cluster_1 = np.where(labels == 1)[0]
+
+    if len(faces_cluster_0) == 0 or len(faces_cluster_1) == 0:
+        print("Error: K-Means resulted in an empty cluster. The model might be monochromatic or have insufficient color variation.")
+        return
+
+    print(f"Splitting mesh: {len(faces_cluster_0)} faces in cluster 0, {len(faces_cluster_1)} faces in cluster 1")
+
+    # Create new meshes using trimesh's submesh capability
+    # 'append=True' ensures vertices are copied, making the meshes independent
+    try:
+        mesh_0 = mesh.submesh([faces_cluster_0], append=True)
+        mesh_1 = mesh.submesh([faces_cluster_1], append=True)
+    except Exception as e:
+        # Sometimes submesh fails if faces are degenerate after processing
+        print(f"Error creating submeshes: {e}")
+        print("Attempting alternative splitting method (masking)...")
+        try:
+            mask_0 = np.zeros(len(mesh.faces), dtype=bool)
+            mask_0[faces_cluster_0] = True
+            mesh_0 = mesh.copy()
+            mesh_0.update_faces(mask_0)
+            mesh_0.remove_unreferenced_vertices()
+
+            mask_1 = np.zeros(len(mesh.faces), dtype=bool)
+            mask_1[faces_cluster_1] = True
+            mesh_1 = mesh.copy()
+            mesh_1.update_faces(mask_1)
+            mesh_1.remove_unreferenced_vertices()
+            # This masking method might be less robust for clean geometry separation for printing
+            print("Alternative splitting method finished. Check outputs carefully.")
+        except Exception as e2:
+            print(f"Alternative splitting method also failed: {e2}")
+            return
+
+
+    # Export the meshes as STL files
+    output_stl_0 = f"{output_prefix}_color_0.stl"
+    output_stl_1 = f"{output_prefix}_color_1.stl"
+
+    try:
+        print(f"Exporting {output_stl_0}...")
+        mesh_0.export(output_stl_0)
+        print(f"Exporting {output_stl_1}...")
+        mesh_1.export(output_stl_1)
+        print("Export complete.")
+    except Exception as e:
+        print(f"Error exporting STL files: {e}")
