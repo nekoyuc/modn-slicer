@@ -114,17 +114,16 @@ def get_colors_from_texture(mesh):
     tex_pixels = np.array(texture)
     tex_height, tex_width, _ = tex_pixels.shape
     uv = mesh.visual.uv
+
+    return texture
+
+def subdivide_mesh_add_vertex_color_to_obj(mesh, texture):
+    tex_pixels = np.array(texture)
+    tex_height, tex_width, _ = tex_pixels.shape
+    uv = mesh.visual.uv
+
     # Reshape texture pixels for clustering
     reshaped_pixels = tex_pixels.reshape(-1, 3)
-
-    # Cluster colors into two
-
-    '''
-    # Map UV coordinates to pixel indices
-    uv[:, 0] = uv[:, 0] * (tex_width - 1)
-    uv[:, 1] = (1 - uv[:, 1]) * (tex_height - 1)  # Flip Y-axis for image coordinates
-    uv = np.round(uv).astype(int)
-    '''
 
     # Cluster colors into two groups
     kmeans = KMeans(n_clusters=2, random_state=0).fit(reshaped_pixels)
@@ -189,21 +188,16 @@ def get_colors_from_texture(mesh):
             #print(f"Homogeneous face at depth {depth}: {color_labels[0]}")
             return [(vertices, uvs, color_labels[0])]
         else:
-            # Subdivide into 4 smaller triangles (midpoint subdivision)
+            # Subdivide into 3 triangles by adding a centroid vertex
             v0, v1, v2 = vertices
             uv0, uv1, uv2 = uvs
-            vm01 = (v0 + v1) / 2
-            vm12 = (v1 + v2) / 2
-            vm20 = (v2 + v0) / 2
-            uvm01 = (uv0 + uv1) / 2
-            uvm12 = (uv1 + uv2) / 2
-            uvm20 = (uv2 + uv0) / 2
-            # 4 new triangles
+            v_centroid = (v0 + v1 + v2) / 3
+            uv_centroid = (uv0 + uv1 + uv2) / 3
+            # 3 new triangles, each sharing the centroid
             tris = [
-                ([v0, vm01, vm20], [uv0, uvm01, uvm20]),
-                ([vm01, v1, vm12], [uvm01, uv1, uvm12]),
-                ([vm20, vm12, v2], [uvm20, uvm12, uv2]),
-                ([vm01, vm12, vm20], [uvm01, uvm12, uvm20]),
+                ([v0, v1, v_centroid], [uv0, uv1, uv_centroid]),
+                ([v1, v2, v_centroid], [uv1, uv2, uv_centroid]),
+                ([v2, v0, v_centroid], [uv2, uv0, uv_centroid]),
             ]
             result = []
             for verts, uvs_ in tris:
@@ -252,15 +246,25 @@ def get_colors_from_texture(mesh):
         face_indices.append(tuple(idxs))
 
     # --- Export to OBJ ---
-    output_obj_file = "models/birdy/birdy_posterized.obj"
+    output_obj_file = "models/birdy/1_2_3_4.obj"
     with open(output_obj_file, 'w') as f:
         for v in vertex_list:
             f.write(f"v {v[0]} {v[1]} {v[2]} {v[3]} {v[4]} {v[5]}\n")
         for face in face_indices:
             f.write(f"f {face[0]} {face[1]} {face[2]}\n")
     print(f"Exported subdivided mesh with posterized vertex colors to {output_obj_file}")
-    
-    '''
+
+
+def add_vertex_color_to_obj(mesh, texture):
+    tex_pixels = np.array(texture)
+    tex_height, tex_width, _ = tex_pixels.shape
+    uv = mesh.visual.uv
+
+    # Map UV coordinates to pixel indices
+    uv[:, 0] = uv[:, 0] * (tex_width - 1)
+    uv[:, 1] = (1 - uv[:, 1]) * (tex_height - 1)  # Flip Y-axis for image coordinates
+    uv = np.round(uv).astype(int)
+
     # Get RGB values for each vertex
     vertex_colors = tex_pixels[uv[:, 1], uv[:, 0], :3]  # Extract RGB values
 
@@ -275,11 +279,8 @@ def get_colors_from_texture(mesh):
     # Add clustered RGB values to vertices
     vertices_with_colors = np.hstack((mesh.vertices, clustered_colors / 255.0))  # Normalize RGB to [0, 1]
     
-
-    # -------- Exporting to OBJ --------
-    #############################################
     # Write to OBJ file
-    output_obj_file = "models/birdy/birdy_cv.obj"
+    output_obj_file = "models/birdy/1_2_4.obj"
     with open(output_obj_file, 'w') as f:
         for vertex in vertices_with_colors:
             f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]} {vertex[3]} {vertex[4]} {vertex[5]}\n")
@@ -287,10 +288,13 @@ def get_colors_from_texture(mesh):
             f.write(f"f {face[0] + 1} {face[1] + 1} {face[2] + 1}\n")
 
     print(f"Exported mesh with clustered vertex colors to {output_obj_file}")
-    '''
 
 
 
-INPUT_GLB_FILE = Path("models/birdy/birdy.glb")
+
+INPUT_GLB_FILE = Path("models/birdy/1_2.glb")
 mesh = load_mesh(INPUT_GLB_FILE)
-get_colors_from_texture(mesh)
+texture = get_colors_from_texture(mesh)
+
+#add_vertex_color_to_obj(mesh, texture)
+subdivide_mesh_add_vertex_color_to_obj(mesh, texture)
