@@ -296,5 +296,6 @@ INPUT_GLB_FILE = Path("models/birdy/1_2.glb")
 mesh = load_mesh(INPUT_GLB_FILE)
 texture = get_colors_from_texture(mesh)
 
-#add_vertex_color_to_obj(mesh, texture)
-subdivide_mesh_add_vertex_color_to_obj(mesh, texture)
+# Use one of the two following functions to process the mesh
+add_vertex_color_to_obj(mesh, texture)
+#subdivide_mesh_add_vertex_color_to_obj(mesh, texture)
